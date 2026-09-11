@@ -1,0 +1,28 @@
+gantt
+    title SwarmEval PoC Timeline (2.5 Months)
+    dateFormat  WW
+    axisFormat  %W
+    excludes    weekends
+
+    section Phase 1: Observability & Evaluation
+    Task Recorder & Interface   :a1, 1, 4w
+    Task Format & Metrics       :after a1, 2w
+    Basic Reporting & Export    :after a1, 3w
+
+    section Phase 2: Coordination Analysis
+    Graph & Utilization         :b1, 5, 3w
+    Communication & Redundancy  :after b1, 2w
+    Dependency & Smells         :after b1, 3w
+
+    section Phase 3: Causal & Research Features
+    Benchmark & Ablation        :c1, 8, 3w
+    Failure Injection & CI      :after c1, 2w
+    Intelligence vs Coordination:after c1, 2w
+
+    section Phase 4: Optimization
+    Recommendations & Prediction:d1, 10, 2w
+    Validation & Comparison     :after d1, 2w
+
+    %% Milestones
+    milestone MVP Ready         :milestone1, 9w
+    milestone Final Validation  :milestone2, 10w
