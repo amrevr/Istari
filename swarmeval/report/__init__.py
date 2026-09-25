@@ -1,4 +1,3 @@
-from .text import render_ablation, render_comparison, render_frontier, render_resilience, render_text
-from .html import render_html
+from .text import render_text, render_trajectory
 
-__all__ = ["render_ablation", "render_comparison", "render_frontier", "render_resilience", "render_text", "render_html"]
+__all__ = ["render_text", "render_trajectory"]

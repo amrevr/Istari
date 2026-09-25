@@ -1,15 +1,20 @@
-"""Layer 2 -- efficiency: cost and latency."""
+"""Layer 2 -- efficiency: tokens, cost and latency for one trajectory.
+
+Phase 1 reports what was directly recorded: token usage, call counts, cost,
+wall clock time and per-agent time.  Critical path and parallelism analysis
+need the execution graph and are Phase 2 work.
+"""
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from ..graph.builder import ExecutionGraph
 from ..schema import EventType, Trajectory
 
 
 def union_length(intervals: List[Tuple[float, float]]) -> float:
+    """Total length covered by a set of possibly overlapping intervals."""
     ivs = sorted((a, b) for a, b in intervals if b > a)
     total = 0.0
     cur_a, cur_b = None, None
@@ -29,9 +34,12 @@ def union_length(intervals: List[Tuple[float, float]]) -> float:
 @dataclass
 class AgentEfficiency:
     agent_id: str
+    role: Optional[str] = None
     spans: int = 0
     llm_calls: int = 0
     tool_calls: int = 0
+    messages_sent: int = 0
+    artifacts_produced: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: Optional[float] = None
@@ -62,12 +70,10 @@ class EfficiencyMetrics:
     cost_usd: Optional[float] = None
     cost_complete: bool = True
     wall_clock_s: float = 0.0
-    critical_path_s: float = 0.0
-    total_work_s: float = 0.0
-    agent_compute_s: float = 0.0
-    waiting_time_s: float = 0.0
+    agent_time_s: float = 0.0     # sum of agent self time (aggregate work)
     llm_latency_s: float = 0.0
     tool_latency_s: float = 0.0
+    waiting_time_s: float = 0.0
     errors: int = 0
     per_agent: Dict[str, AgentEfficiency] = field(default_factory=dict)
 
@@ -77,7 +83,7 @@ class EfficiencyMetrics:
         return d
 
 
-def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMetrics:
+def compute_efficiency(traj: Trajectory) -> EfficiencyMetrics:
     m = EfficiencyMetrics()
     per: Dict[str, AgentEfficiency] = {}
 
@@ -86,6 +92,7 @@ def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMet
             per[aid] = AgentEfficiency(aid)
         return per[aid]
 
+    busy: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
     for ev in traj.events:
         if ev.event_type == EventType.LLM_CALL.value:
             m.llm_calls += 1
@@ -96,6 +103,8 @@ def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMet
                 m.cost_complete = False
             else:
                 m.cost_usd = (m.cost_usd or 0.0) + ev.cost_usd
+            if ev.span_id:
+                busy[ev.span_id].append((ev.timestamp, ev.end_timestamp))
             if ev.agent_id:
                 a = agent(ev.agent_id)
                 a.llm_calls += 1
@@ -110,6 +119,8 @@ def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMet
         elif ev.event_type == EventType.TOOL_CALL.value:
             m.tool_calls += 1
             m.tool_latency_s += ev.duration_s
+            if ev.span_id:
+                busy[ev.span_id].append((ev.timestamp, ev.end_timestamp))
             if ev.agent_id:
                 agent(ev.agent_id).tool_calls += 1
             if ev.status == "error":
@@ -119,6 +130,10 @@ def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMet
         elif ev.event_type == EventType.MESSAGE.value:
             m.messages += 1
             m.message_tokens += ev.content_tokens
+            if ev.sender:
+                agent(ev.sender).messages_sent += 1
+        elif ev.event_type == EventType.ARTIFACT.value and ev.agent_id:
+            agent(ev.agent_id).artifacts_produced += 1
         elif ev.event_type == EventType.ERROR.value:
             m.errors += 1
     m.total_tokens = m.input_tokens + m.output_tokens
@@ -130,25 +145,20 @@ def compute_efficiency(traj: Trajectory, graph: ExecutionGraph) -> EfficiencyMet
     for s in traj.spans.values():
         if s.parent_span_id and s.end is not None:
             children[s.parent_span_id].append((s.start, s.end))
-    busy: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    for u in graph.units:
-        busy[u.span_id].append((u.start, u.end))
     for s in traj.spans.values():
         if s.end is None:
             continue
         a = agent(s.agent_id)
         a.spans += 1
+        a.role = a.role or s.role
         child_time = union_length([(max(s.start, c0), min(s.end, c1)) for c0, c1 in children.get(s.span_id, [])])
         self_time = max(0.0, s.duration - child_time)
         busy_time = union_length(busy.get(s.span_id, []))
-        idle = max(0.0, self_time - busy_time)
         a.self_time_s += self_time
         a.busy_time_s += busy_time
-        a.idle_time_s += idle
+        a.idle_time_s += max(0.0, self_time - busy_time)
     m.per_agent = per
-    m.agent_compute_s = sum(a.self_time_s for a in per.values())
+    m.agent_time_s = sum(a.self_time_s for a in per.values())
     m.waiting_time_s = sum(a.idle_time_s for a in per.values())
     m.wall_clock_s = traj.duration
-    m.critical_path_s, _ = graph.critical_path()
-    m.total_work_s = graph.total_work()
     return m

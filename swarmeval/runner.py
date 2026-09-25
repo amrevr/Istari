@@ -8,17 +8,17 @@ import json
 import sys
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from . import evaluators as _evaluators
-from .config import SwarmConfig
 from .pricing import PricingTable
 from .recorder import Clock, RunContext, WallClock
 from .schema import Benchmark, Evaluation, EventType, Status, Task, Trajectory
 
 
 class Swarm:
-    """Interface swarms implement.  ``run`` returns the final output."""
+    """Interface swarms implement.  ``run`` returns the final output and
+    records everything it does through ``ctx``."""
 
     def run(self, task: Task, ctx: RunContext) -> Any:  # pragma: no cover - interface
         raise NotImplementedError
@@ -32,29 +32,30 @@ class FunctionSwarm(Swarm):
         return self.fn(task, ctx)
 
 
-SwarmFactory = Callable[[SwarmConfig], Swarm]
+SwarmFactory = Callable[[], Swarm]
 
 
 def as_factory(swarm: Any) -> SwarmFactory:
-    """Accept a Swarm instance, a ``factory(config) -> Swarm`` or a bare
-    ``run(task, ctx)`` function and normalise to a factory."""
+    """Accept a Swarm instance, a zero-argument ``factory() -> Swarm`` or a
+    bare ``run(task, ctx)`` function and normalise to a factory."""
     if hasattr(swarm, "run") and callable(getattr(swarm, "run")):
-        return lambda cfg: swarm
+        return lambda: swarm
     if callable(swarm):
         try:
             n = len([p for p in inspect.signature(swarm).parameters.values()
                      if p.default is inspect.Parameter.empty and p.kind in
                      (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)])
         except (TypeError, ValueError):
-            n = 1
+            n = 0
         if n == 2:
             fn = swarm
-            return lambda cfg: FunctionSwarm(fn)
-        return swarm  # assume factory(config)
-    raise TypeError("swarm must be a Swarm, a factory(config) -> Swarm, or a run(task, ctx) function")
+            return lambda: FunctionSwarm(fn)
+        return swarm  # assume factory()
+    raise TypeError("swarm must be a Swarm, a factory() -> Swarm, or a run(task, ctx) function")
 
 
 def derive_seed(base: int, task_id: str, trial: int) -> int:
+    """Deterministic per-run seed so a run set can be reproduced exactly."""
     h = hashlib.sha1(f"{base}|{task_id}|{trial}".encode()).hexdigest()
     return int(h[:8], 16)
 
@@ -74,8 +75,10 @@ class RunOptions:
 
 @dataclass
 class RunSet:
+    """All trajectories from one evaluation of one swarm on one benchmark.
+    Trajectories are the source of truth: every report can be recomputed
+    from a saved RunSet."""
     label: str
-    config: SwarmConfig
     benchmark_name: str
     trajectories: List[Trajectory] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -105,21 +108,13 @@ class RunSet:
                 return t
         return None
 
-    def paired_with(self, other: "RunSet") -> List[Tuple[Trajectory, Trajectory]]:
-        pairs = []
-        for t in self.trajectories:
-            o = other.get(t.task_id, t.trial)
-            if o is not None:
-                pairs.append((t, o))
-        return pairs
-
     def to_dict(self) -> Dict[str, Any]:
-        return {"label": self.label, "config": self.config.to_dict(), "benchmark_name": self.benchmark_name,
+        return {"label": self.label, "benchmark_name": self.benchmark_name,
                 "trajectories": [t.to_dict() for t in self.trajectories], "metadata": self.metadata}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RunSet":
-        return cls(d.get("label", "runs"), SwarmConfig.from_dict(d.get("config", {})), d.get("benchmark_name", ""),
+        return cls(d.get("label", "runs"), d.get("benchmark_name", ""),
                    [Trajectory.from_dict(t) for t in d.get("trajectories", [])], d.get("metadata", {}))
 
     def save(self, path: str) -> None:
@@ -133,12 +128,13 @@ class RunSet:
 
 
 class SwarmRunner:
-    def __init__(self, swarm: Any, benchmark: Benchmark, config: Optional[SwarmConfig] = None,
+    def __init__(self, swarm: Any, benchmark: Benchmark, label: str = "baseline",
                  options: Optional[RunOptions] = None, **kwargs: Any) -> None:
         self.factory = as_factory(swarm)
         self.benchmark = benchmark
-        self.config = config or SwarmConfig()
+        self.label = label
         self.options = options or RunOptions(**kwargs)
+        self.benchmark.validate()
 
     def _clock(self) -> Clock:
         return self.options.clock_factory() if self.options.clock_factory else WallClock()
@@ -146,9 +142,9 @@ class SwarmRunner:
     def run_task(self, task: Task, trial: int = 0) -> Trajectory:
         opts = self.options
         seed = derive_seed(opts.seed, task.task_id, trial)
-        ctx = RunContext(task, self.config, clock=self._clock(), seed=seed, trial=trial,
+        ctx = RunContext(task, clock=self._clock(), seed=seed, trial=trial,
                          pricing=opts.pricing, capture_text=opts.capture_text)
-        swarm = self.factory(self.config)
+        swarm = self.factory()
         ctx.start()
         output: Any = None
         status = Status.SUCCESS.value
@@ -189,7 +185,7 @@ class SwarmRunner:
             return Evaluation(False, 0.0, evaluator.name, {"reason": f"evaluator error: {exc}"})
 
     def run(self) -> RunSet:
-        rs = RunSet(self.config.label, self.config, self.benchmark.name)
+        rs = RunSet(self.label, self.benchmark.name)
         total = len(self.benchmark.tasks) * self.options.trials
         done = 0
         for trial in range(self.options.trials):
@@ -197,7 +193,7 @@ class SwarmRunner:
                 rs.trajectories.append(self.run_task(task, trial))
                 done += 1
                 if self.options.progress:
-                    sys.stderr.write(f"\r[{self.config.label}] {done}/{total} runs")
+                    sys.stderr.write(f"\r[{self.label}] {done}/{total} runs")
                     sys.stderr.flush()
         if self.options.progress:
             sys.stderr.write("\n")

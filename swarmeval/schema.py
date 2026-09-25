@@ -1,7 +1,8 @@
-"""Core data model for SwarmEval.
+"""Core data model for SwarmEval (Phase 1: trajectory schema and task format).
 
-Everything downstream (metrics, graphs, diagnostics, causal experiments) is
-computed from the structures defined here.  The guiding rule from the design:
+Everything downstream (metrics, reports, exports and the later coordination
+and causal layers) is computed from the structures defined here.  The guiding
+rule from the design:
 
     If the execution cannot be represented as structured events,
     it cannot be reliably analyzed.
@@ -33,7 +34,6 @@ class EventType(str, Enum):
     WAIT = "wait"
     ERROR = "error"
     EVAL = "eval"
-    INTERVENTION = "intervention"
     ANNOTATION = "annotation"
 
 
@@ -41,22 +41,17 @@ class Status(str, Enum):
     SUCCESS = "success"
     ERROR = "error"
     SKIPPED = "skipped"
-    DROPPED = "dropped"      # message dropped by an intervention
-    DISABLED = "disabled"    # component disabled by configuration
-    INJECTED = "injected"    # failure injected by an experiment
 
 
 class MessageKind(str, Enum):
-    """Coarse classification of messages used for communication accounting."""
-    TASK_ASSIGNMENT = "task_assignment"   # coordination
-    COORDINATION = "coordination"         # coordination
-    INFORMATION = "information"           # information transfer
-    RESULT = "result"                     # information transfer
-    REQUEST = "request"                   # coordination
-    FEEDBACK = "feedback"                 # information transfer
-
-
-COORDINATION_KINDS = {"task_assignment", "coordination", "request", "ack", "status"}
+    """Coarse classification of messages.  Recorded now so that the
+    communication analysis planned for Phase 2 has data to work with."""
+    TASK_ASSIGNMENT = "task_assignment"
+    COORDINATION = "coordination"
+    INFORMATION = "information"
+    RESULT = "result"
+    REQUEST = "request"
+    FEEDBACK = "feedback"
 
 
 # --------------------------------------------------------------------------- #
@@ -103,7 +98,8 @@ class Event:
     """A single structured execution event.
 
     The schema is intentionally flat so it serialises to one JSON object per
-    line and maps cleanly onto OpenTelemetry spans.
+    line.  Not every field applies to every event type; unused fields keep
+    their defaults.
     """
     event_id: str
     run_id: str
@@ -123,7 +119,7 @@ class Event:
     tool_args: Any = None
     sender: Optional[str] = None
     receiver: Optional[str] = None
-    kind: Optional[str] = None             # message kind / artifact name / wait reason
+    kind: Optional[str] = None             # message kind / artifact name / wait reason / role
     content: Any = None                    # message content, output preview, ...
     content_tokens: int = 0
     content_hash: Optional[str] = None
@@ -164,7 +160,6 @@ class Artifact:
     content: Any
     content_hash: str
     tokens: int
-    intent: Optional[str] = None         # e.g. "verification" marks intentional redundancy
     event_id: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -208,10 +203,16 @@ class Span:
 
 
 # --------------------------------------------------------------------------- #
-# Tasks & benchmarks
+# Tasks & benchmarks (the standardized task format)
 # --------------------------------------------------------------------------- #
 @dataclass
 class Task:
+    """One benchmark task.
+
+    ``evaluator`` is either an ``Evaluator`` instance or a JSON spec such as
+    ``{"type": "contains_all", "keywords": [...]}`` so benchmarks can live in
+    plain files.
+    """
     task_id: str
     input: Any
     category: str = "general"
@@ -219,9 +220,17 @@ class Task:
     success_criteria: Optional[str] = None
     constraints: List[str] = field(default_factory=list)
     reference: Any = None
-    evaluator: Any = None                 # Evaluator instance or spec dict
+    evaluator: Any = None
     difficulty: Optional[str] = None      # "simple" | "moderate" | "hard"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not self.task_id or not isinstance(self.task_id, str):
+            raise ValueError("task_id must be a non-empty string")
+        if self.input is None:
+            raise ValueError(f"task {self.task_id!r} has no input")
+        if self.difficulty not in (None, "simple", "moderate", "hard"):
+            raise ValueError(f"task {self.task_id!r}: difficulty must be simple|moderate|hard")
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -255,6 +264,14 @@ class Benchmark:
             if t.task_id == task_id:
                 return t
         raise KeyError(task_id)
+
+    def validate(self) -> None:
+        seen = set()
+        for t in self.tasks:
+            t.validate()
+            if t.task_id in seen:
+                raise ValueError(f"duplicate task_id {t.task_id!r} in benchmark {self.name!r}")
+            seen.add(t.task_id)
 
     def to_dict(self) -> Dict[str, Any]:
         ev = self.default_evaluator
@@ -299,43 +316,23 @@ class Benchmark:
 # Evaluation results
 # --------------------------------------------------------------------------- #
 @dataclass
-class Judgment:
-    judge: str
-    score: float
-    success: bool
-    rationale: str = ""
-    raw: Any = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
 class Evaluation:
     success: bool
     score: float
     evaluator: str = "unknown"
     details: Dict[str, Any] = field(default_factory=dict)
-    judgments: List[Judgment] = field(default_factory=list)
-    agreement: Optional[float] = None      # inter-judge agreement (0..1)
-    confidence: Optional[float] = None     # evaluator's own confidence (0..1)
     constraints_passed: Optional[bool] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Evaluation":
-        judgments = [Judgment(**j) for j in d.get("judgments", [])]
         return cls(
             success=bool(d.get("success", False)),
             score=float(d.get("score", 0.0)),
             evaluator=d.get("evaluator", "unknown"),
             details=d.get("details", {}),
-            judgments=judgments,
-            agreement=d.get("agreement"),
-            confidence=d.get("confidence"),
             constraints_passed=d.get("constraints_passed"),
         )
 
@@ -349,7 +346,6 @@ class Trajectory:
     run_id: str
     task_id: str
     task: Task
-    config: Dict[str, Any] = field(default_factory=dict)
     seed: int = 0
     trial: int = 0
     events: List[Event] = field(default_factory=list)
@@ -362,7 +358,6 @@ class Trajectory:
     status: str = Status.SUCCESS.value
     error: Optional[str] = None
     evaluation: Optional[Evaluation] = None
-    interventions: List[Dict[str, Any]] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # -- convenience accessors ------------------------------------------------
@@ -387,7 +382,7 @@ class Trajectory:
 
     def agent_ids(self) -> List[str]:
         seen: List[str] = []
-        for s in self.spans.values():
+        for s in sorted(self.spans.values(), key=lambda s: s.start):
             if s.agent_id not in seen:
                 seen.append(s.agent_id)
         return seen
@@ -434,7 +429,6 @@ class Trajectory:
             "run_id": self.run_id,
             "task_id": self.task_id,
             "task": self.task.to_dict(),
-            "config": self.config,
             "seed": self.seed,
             "trial": self.trial,
             "events": [e.to_dict() for e in self.events],
@@ -447,7 +441,6 @@ class Trajectory:
             "status": self.status,
             "error": self.error,
             "evaluation": self.evaluation.to_dict() if self.evaluation else None,
-            "interventions": self.interventions,
             "metadata": self.metadata,
         }
 
@@ -457,7 +450,6 @@ class Trajectory:
             run_id=d["run_id"],
             task_id=d["task_id"],
             task=Task.from_dict(d["task"]),
-            config=d.get("config", {}),
             seed=d.get("seed", 0),
             trial=d.get("trial", 0),
             events=[Event.from_dict(e) for e in d.get("events", [])],
@@ -470,7 +462,6 @@ class Trajectory:
             status=d.get("status", "success"),
             error=d.get("error"),
             evaluation=Evaluation.from_dict(d["evaluation"]) if d.get("evaluation") else None,
-            interventions=d.get("interventions", []),
             metadata=d.get("metadata", {}),
         )
 

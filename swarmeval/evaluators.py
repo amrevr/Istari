@@ -1,16 +1,17 @@
-"""Evaluators: deterministic and LLM-based judgments of task outcomes.
+"""Evaluators: deterministic judgments of task outcomes.
 
 Every evaluator implements ``evaluate(task, output, trajectory) -> Evaluation``
 and, where serialisable, ``to_spec()`` so benchmarks can be stored as JSON.
+LLM-based judging is planned for a later phase; use ``CallableEvaluator`` to
+plug in your own judge in the meantime.
 """
 from __future__ import annotations
 
-import json
 import re
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
-from .schema import Evaluation, Judgment, Task, Trajectory, to_text
-from .stats import containment, mean, pairwise_agreement, stdev
+from .schema import Evaluation, Task, Trajectory, to_text
+from .stats import mean
 
 
 class Evaluator:
@@ -186,26 +187,6 @@ class ToolUseEvaluator(Evaluator):
                 "forbidden_tools": self.forbidden_tools, "allow_errors": self.allow_errors}
 
 
-class Groundedness(Evaluator):
-    """Deterministic groundedness proxy: fraction of the output's 3-gram
-    shingles that appear in recorded tool results or artifacts."""
-    name = "groundedness"
-
-    def __init__(self, threshold: float = 0.5) -> None:
-        self.threshold = threshold
-
-    def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
-        if trajectory is None:
-            return Evaluation(False, 0.0, self.name, {"reason": "no trajectory"})
-        evidence = "\n".join(to_text(e.content) for e in trajectory.tool_calls() if e.content is not None)
-        evidence += "\n" + "\n".join(to_text(a.content) for a in trajectory.artifacts.values())
-        score = containment(to_text(output), evidence)
-        return Evaluation(score >= self.threshold, score, self.name, {"threshold": self.threshold})
-
-    def to_spec(self) -> Dict[str, Any]:
-        return {"type": self.name, "threshold": self.threshold}
-
-
 class Constraints(Evaluator):
     """All sub-evaluators must pass (hard constraints)."""
     name = "constraints"
@@ -249,97 +230,6 @@ class Composite(Evaluator):
 
 
 # --------------------------------------------------------------------------- #
-# LLM judge
-# --------------------------------------------------------------------------- #
-DEFAULT_RUBRIC = (
-    "You are grading the output of an AI system on a task. Judge whether the output "
-    "correctly and completely accomplishes the task. Respond with JSON only: "
-    '{"score": <0.0-1.0>, "success": <true|false>, "rationale": "<one or two sentences>"}'
-)
-
-
-def build_judge_prompt(task: Task, output: Any, rubric: str = DEFAULT_RUBRIC) -> str:
-    parts = [rubric, "", "TASK:", to_text(task.input)]
-    if task.success_criteria:
-        parts += ["", "SUCCESS CRITERIA:", task.success_criteria]
-    if task.constraints:
-        parts += ["", "CONSTRAINTS:"] + [f"- {c}" for c in task.constraints]
-    if task.reference is not None:
-        parts += ["", "REFERENCE SOLUTION:", to_text(task.reference)]
-    elif task.expected is not None:
-        parts += ["", "EXPECTED:", to_text(task.expected)]
-    parts += ["", "OUTPUT TO GRADE:", to_text(output)]
-    return "\n".join(parts)
-
-
-def parse_judgment(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            d = json.loads(m.group(0))
-            score = float(d.get("score", 1.0 if d.get("success") else 0.0))
-            success = bool(d.get("success", score >= 0.5))
-            return {"score": max(0.0, min(1.0, score)), "success": success,
-                    "rationale": str(d.get("rationale", ""))}
-        except (ValueError, TypeError):
-            pass
-    low = text.lower()
-    m2 = re.search(r"score\s*[:=]\s*([01](?:\.\d+)?)", low)
-    if m2:
-        score = float(m2.group(1))
-        return {"score": score, "success": score >= 0.5, "rationale": text[:300]}
-    if "pass" in low or "success: true" in low or "correct" in low:
-        return {"score": 1.0, "success": True, "rationale": text[:300]}
-    return {"score": 0.0, "success": False, "rationale": text[:300]}
-
-
-class LLMJudge(Evaluator):
-    """LLM-based evaluator supporting multiple judgments and agreement.
-
-    ``judges`` is a list of ``(name, fn)`` where ``fn(prompt) -> str``.  A
-    single callable may be passed and will be invoked ``n_judgments`` times.
-    Success is decided by majority vote; score is the mean; ``agreement`` is
-    the pairwise agreement on the success label and ``confidence`` combines
-    agreement with score dispersion.
-    """
-    name = "llm_judge"
-
-    def __init__(self, judge: Any, rubric: str = DEFAULT_RUBRIC, n_judgments: int = 1,
-                 threshold: float = 0.5) -> None:
-        if callable(judge):
-            self.judges: List = [(f"judge_{i+1}", judge) for i in range(max(1, n_judgments))]
-        else:
-            self.judges = [(n, f) for n, f in judge]
-        self.rubric = rubric
-        self.threshold = threshold
-
-    def evaluate(self, task: Task, output: Any, trajectory: Optional[Trajectory] = None) -> Evaluation:
-        prompt = build_judge_prompt(task, output, self.rubric)
-        judgments: List[Judgment] = []
-        for name, fn in self.judges:
-            try:
-                raw = fn(prompt)
-                parsed = parse_judgment(to_text(raw))
-                judgments.append(Judgment(name, parsed["score"], parsed["success"], parsed["rationale"], raw))
-            except Exception as exc:  # a failing judge is recorded, not fatal
-                judgments.append(Judgment(name, 0.0, False, f"judge error: {exc}", None))
-        scores = [j.score for j in judgments]
-        labels = [j.success for j in judgments]
-        score = mean(scores)
-        success = sum(labels) * 2 > len(labels) if labels else False
-        agreement = pairwise_agreement(labels)
-        dispersion = stdev(scores) if len(scores) > 1 else 0.0
-        confidence = (agreement if agreement is not None else 1.0) * (1.0 - min(1.0, dispersion))
-        return Evaluation(success, score, self.name, {"prompt_chars": len(prompt)}, judgments,
-                          agreement, confidence)
-
-    def to_spec(self) -> Dict[str, Any]:
-        return {"type": self.name, "rubric": self.rubric, "n_judgments": len(self.judges),
-                "threshold": self.threshold, "note": "judge callable not serialisable"}
-
-
-# --------------------------------------------------------------------------- #
 # Registry
 # --------------------------------------------------------------------------- #
 _REGISTRY: Dict[str, Callable[[Dict[str, Any]], Evaluator]] = {}
@@ -355,7 +245,6 @@ register("contains_any", lambda s: ContainsAny(s.get("keywords"), s.get("forbidd
 register("regex", lambda s: Regex(s["pattern"]))
 register("numeric", lambda s: NumericTolerance(s.get("expected"), s.get("tolerance", 1e-6), s.get("relative", False)))
 register("tool_use", lambda s: ToolUseEvaluator(s.get("expected_tools", ()), s.get("forbidden_tools", ()), s.get("allow_errors", False)))
-register("groundedness", lambda s: Groundedness(s.get("threshold", 0.5)))
 register("constraints", lambda s: Constraints([from_spec(c) for c in s.get("checks", [])]))
 register("composite", lambda s: Composite([from_spec(e) for e in s.get("evaluators", [])], s.get("weights"),
                                           s.get("threshold", 0.5), s.get("required", ())))

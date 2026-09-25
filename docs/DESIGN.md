@@ -2,7 +2,7 @@
 
 > An evaluation, observability, diagnostic, and causal analysis framework for multi-agent AI systems.
 
-This document is the project's charter: what SwarmEval measures, why, and in what order it was built. The README covers usage; this covers the reasoning.
+This document is the project's charter: what SwarmEval measures, why, and in what order it is being built. The README covers usage; this covers the reasoning. Module references below name where each piece lives or will live; see §11 for what is implemented so far.
 
 ## 1. Core idea
 
@@ -32,7 +32,7 @@ Trajectory Observability + Causal Ablation
 
 **Causal ablation** answers *what changed because a component was present*: remove an agent, tool, channel, model, context, ordering or budget; re-run; compare. This separates *observed activity* from *causal contribution*. An agent can generate thousands of tokens and contribute nothing; another can do very little and prevent a major downstream failure.
 
-Implementation: `swarmeval.schema` (events), `swarmeval.recorder` (capture and intervention enforcement), `swarmeval.causal` (ablation).
+Implementation: `swarmeval.schema` (events) and `swarmeval.recorder` (capture) exist today; `swarmeval.causal` (ablation) is Phase 3.
 
 ## 3. Measurement layers
 
@@ -126,10 +126,12 @@ Task = input, expected behaviour, success criteria, constraints, evaluator spec,
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 1 Observability & evaluation | reproducible trace + evaluation report | done |
-| 2 Coordination analysis | explain where the swarm is inefficient and why | done |
-| 3 Causal & research features | estimate which components actually matter | done |
-| 4 Optimization | experimentally validated architecture improvements | candidate generation + validation done; automatic search and learned predictors future work |
+| 1 Observability & evaluation | reproducible trace + evaluation report | **done** (`schema`, `recorder`, `runner`, `evaluators`, `metrics/performance`, `metrics/efficiency`, `report/text`, `export/jsonl`, `integrations/anthropic`, CLI) |
+| 2 Coordination analysis | explain where the swarm is inefficient and why | planned (`graph/`, `metrics/coordination`, `diagnostics/`) |
+| 3 Causal & research features | estimate which components actually matter | planned (`causal/`, confidence intervals in `stats`, `validity`) |
+| 4 Optimization | experimentally validated architecture improvements | planned (`optimize/`) |
+
+Phase 1 records everything later phases need (messages with kinds, artifact provenance via `input_artifacts` and `consume`, span nesting, timestamps) so trajectories captured now remain analysable when those layers land.
 
 ## 12. Central research question
 

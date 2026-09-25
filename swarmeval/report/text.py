@@ -1,8 +1,9 @@
 """Human-readable text reports (terminal friendly)."""
 from __future__ import annotations
 
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
+from ..schema import EventType, Trajectory, preview
 from ..stats import Summary
 
 
@@ -23,10 +24,8 @@ def _pct(x: float) -> str:
     return f"{x*100:.1f}%"
 
 
-def _ci(s: Summary, pct: bool = False, unit: str = "", digits: int = 1) -> str:
-    if s.n <= 1:
-        return _pct(s.mean) if pct else f"{s.mean:.{digits}f}{unit}"
-    return s.fmt(unit=unit, pct=pct, digits=digits)
+def _spread(s: Summary, unit: str = "", digits: int = 1) -> str:
+    return s.fmt(unit=unit, digits=digits)
 
 
 def box(title: str, rows: Sequence[Any], width: int = 58) -> str:
@@ -48,163 +47,99 @@ def box(title: str, rows: Sequence[Any], width: int = 58) -> str:
     return "\n".join(out)
 
 
-def render_text(result: Any, max_diagnostics: int = 12, show_agents: bool = True, show_validity: bool = True) -> str:
-    perf, eff, coord = result.performance, result.efficiency, result.coordination
+def render_text(result: Any, show_agents: bool = True, show_tasks: bool = True) -> str:
+    perf, eff = result.performance, result.efficiency
     n_runs = len(result.runs)
     rows: List[Any] = [
         f"{result.label}  ·  {result.benchmark}  ·  {perf.n_tasks} tasks × {perf.trials} trials = {n_runs} runs",
         None,
-        ("Task Success", _ci(perf.success_rate, pct=True)),
-        ("Mean Score", _ci(perf.score, digits=3)),
+        ("Task Success", f"{perf.n_successes}/{n_runs}  ({_pct(perf.success_rate)})"),
+        ("Mean Score", f"{perf.mean_score:.3f}"),
     ]
-    if perf.constraint_pass_rate:
-        rows.append(("Constraint Pass", _ci(perf.constraint_pass_rate, pct=True)))
+    if perf.constraint_pass_rate is not None:
+        rows.append(("Constraint Pass", _pct(perf.constraint_pass_rate)))
     if perf.run_errors:
         rows.append(("Runs Crashed", f"{perf.run_errors}/{n_runs}", "⚠"))
     rows += [
         None,
         ("Cost / Run", _money(eff.cost_usd.mean, eff.cost_complete)),
         ("Cost / Successful Task", _money(eff.cost_per_success, eff.cost_complete)),
-        ("Tokens / Run", f"{eff.tokens.mean:,.0f}"),
+        ("Total Cost", _money(eff.cost_total, eff.cost_complete)),
+        ("Tokens / Run", f"{eff.tokens.mean:,.0f}  (in {eff.input_tokens.mean:,.0f} / out {eff.output_tokens.mean:,.0f})"),
         ("LLM Calls / Run", f"{eff.llm_calls.mean:.1f}"),
         ("Tool Calls / Run", f"{eff.tool_calls.mean:.1f}"),
+        ("Messages / Run", f"{eff.messages.mean:.1f}"),
         None,
-        ("Wall Clock", f"{eff.wall_clock_s.mean:.1f}s"),
-        ("Critical Path", f"{eff.critical_path_s.mean:.1f}s"),
-        ("Agent Compute Time", f"{eff.agent_compute_s.mean:.1f}s"),
-        ("Waiting Time", f"{eff.waiting_time_s.mean:.1f}s"),
-        None,
-        ("Communication / Work", _pct(coord.communication_ratio.mean),
-         "⚠" if coord.communication_ratio.mean >= result.smell_config.communication_ratio_warning else ""),
-        ("Redundant Work", _pct(coord.redundancy_ratio.mean), "⚠" if coord.redundancy_ratio.mean >= 0.2 else ""),
-        ("Parallelism (actual)", _pct(coord.actual_parallelism.mean)),
-        ("Parallelism (potential)", _pct(coord.potential_parallelism.mean),
-         "⚠" if coord.parallel_opportunity.mean >= result.smell_config.parallelism_opportunity else ""),
-        ("Context-bloated calls / run", f"{coord.context_bloat_calls.mean:.1f}",
-         "⚠" if coord.context_bloat_calls.mean > 0 else ""),
+        ("Wall Clock / Run", _spread(eff.wall_clock_s, "s")),
+        ("Agent Time / Run", f"{eff.agent_time_s.mean:.1f}s"),
+        ("Waiting Time / Run", f"{eff.waiting_time_s.mean:.1f}s"),
     ]
-    if result.leakage:
-        rows.append(("Leakage Warnings", str(len(result.leakage)), "⚠"))
+    if eff.errors.total:
+        rows.append(("Errors (all runs)", f"{eff.errors.total:.0f}", "⚠"))
     parts = [box("SWARM EVALUATION", rows)]
     if not eff.cost_complete:
         parts.append("  * cost incomplete: some models have no pricing entry")
+    if perf.trials > 1:
+        parts.append("  per-trial success: " + ", ".join(_pct(x) for x in perf.per_trial))
 
-    if show_agents and coord.utilization:
+    if show_agents and eff.per_agent:
         parts.append("")
-        parts.append("AGENT UTILIZATION (observed, not causal)")
-        parts.append(f"  {'agent':<16}{'role':<12}{'tokens':<26}{'contrib':>8}{'dead':>7}{'invoked':>9}{'cost':>10}")
-        for aid, u in sorted(coord.utilization.items(), key=lambda kv: -kv[1]["token_share"]):
-            cost = eff.per_agent.get(aid, {}).get("cost_usd")
+        parts.append("AGENTS (per run, mean)")
+        parts.append(f"  {'agent':<16}{'role':<12}{'tokens':<24}{'llm':>5}{'tools':>6}{'msgs':>6}{'time':>8}{'cost':>10}")
+        for aid, u in sorted(eff.per_agent.items(), key=lambda kv: -kv[1]["token_share"]):
             parts.append(f"  {aid:<16}{(u.get('role') or '-')[:11]:<12}{bar(u['token_share'])} {u['token_share']*100:>4.0f}%"
-                         f"{u['observed_contribution']*100:>7.0f}%{u['dead_rate']*100:>6.0f}%{u['invocation_rate']*100:>8.0f}%"
-                         f"{_money(cost):>10}")
-        parts.append("  contrib = share of the agent's output used downstream / in the final answer (observed).")
-        if coord.highest_overlap:
-            a, b = coord.highest_overlap["agents"]
-            parts.append(f"  Highest overlap: {a} ↔ {b}  ({_pct(coord.highest_overlap['overlap'])})")
+                         f"{u['llm_calls']:>5.1f}{u['tool_calls']:>6.1f}{u['messages_sent']:>6.1f}"
+                         f"{u['self_time_s']:>7.1f}s{_money(u['cost_usd']):>10}")
 
-    diags = result.diagnostics[:max_diagnostics]
-    parts.append("")
-    parts.append(f"DIAGNOSTICS ({len(result.diagnostics)} findings; hypotheses, not verdicts)")
-    if not diags:
-        parts.append("  none")
-    for d in diags:
-        icon = {"critical": "✖", "warning": "⚠", "info": "ℹ"}.get(d.severity, "•")
-        prev = f" — in {_pct(d.prevalence)} of runs" if d.prevalence is not None else ""
-        parts.append(f"\n{icon} {d.title} [{d.smell}]{prev}")
-        parts.append(f"  Observed: {d.observation}")
-        parts.append(f"  Hypothesis: {d.hypothesis}")
-        parts.append(f"  Potential intervention: {d.recommendation}")
-
-    if show_validity:
+    if show_tasks and perf.per_task:
         parts.append("")
-        parts.append("VALIDITY")
-        parts.append(f"  Repeated trials: {perf.trials}; per-trial success: "
-                     + ", ".join(_pct(x) for x in perf.per_trial))
-        unstable = [t for t, r in result.repeatability.items() if r.get("unstable")]
-        if unstable:
-            parts.append(f"  Unstable tasks (mixed outcomes across trials): {', '.join(unstable)}")
-        if perf.evaluator_agreement is not None:
-            parts.append(f"  Evaluator agreement: {_pct(perf.evaluator_agreement)}; confidence: "
-                         f"{_pct(perf.evaluator_confidence or 0)}")
-        parts.append(f"  Evaluators: {', '.join(perf.evaluators) or 'none'}")
-        for w in result.leakage[:5]:
-            parts.append(f"  ⚠ leakage: {w}")
+        parts.append("TASKS")
+        parts.append(f"  {'task':<16}{'success':>9}{'score':>8}{'cost':>10}{'latency':>9}")
+        for tid, t in perf.per_task.items():
+            parts.append(f"  {tid:<16}{_pct(t['success_rate']):>9}{t['score']:>8.2f}{_money(t['cost_usd']):>10}"
+                         f"{t['latency_s']:>8.1f}s")
+    parts.append("")
+    parts.append(f"Evaluators: {', '.join(perf.evaluators) or 'none'}")
     return "\n".join(parts)
 
 
-def _signed_pct(x: Optional[float]) -> str:
-    return "n/a" if x is None else f"{x*100:+.0f}%"
-
-
-def render_comparison(comp: Any) -> str:
-    lines = [f"{comp.baseline_label}  →  {comp.variant_label}   ({comp.n_pairs} paired runs)",
-             f"  Δ success   {comp.success_delta*100:+.1f} pp  [{comp.success_ci[0]*100:+.1f}, {comp.success_ci[1]*100:+.1f}]"
-             + ("  *" if comp.significant else ""),
-             f"  Δ score     {comp.score_delta:+.3f}  [{comp.score_ci[0]:+.3f}, {comp.score_ci[1]:+.3f}]",
-             f"  Δ cost      {comp.cost_delta:+.4f} $/run ({_signed_pct(comp.cost_delta_pct)})",
-             f"  Δ latency   {comp.latency_delta:+.2f} s ({_signed_pct(comp.latency_delta_pct)}); "
-             f"Δ critical path {comp.critical_path_delta:+.2f} s",
-             f"  Δ tokens    {_signed_pct(comp.tokens_delta_pct)}"]
-    if comp.significant:
-        lines.append("  * 95% CI excludes zero")
-    return "\n".join(lines)
-
-
-def render_ablation(report: Any) -> str:
-    b = report.baseline
-    head = (f"ABLATION vs {b.label}  (success {_pct(b.success_rate)}, {_money(b.cost['per_run'])}/run, "
-            f"{b.latency['wall_clock']:.1f}s)")
-    lines = [head, f"  {'component':<20}{'Δ success':>12}{'95% CI':>20}{'Δ cost':>10}{'Δ latency':>11}"
-                   f"{'crashes':>9}{'observed':>10}"]
-    for r in report.ranking():
-        c = r.comparison
-        obs = "n/a" if r.observed_contribution is None else _pct(r.observed_contribution)
-        lines.append(f"  {r.component:<20}{c.success_delta*100:>+11.1f}p"
-                     f"{'[' + f'{c.success_ci[0]*100:+.0f}, {c.success_ci[1]*100:+.0f}' + ']':>20}"
-                     f"{_signed_pct(c.cost_delta_pct):>10}{_signed_pct(c.latency_delta_pct):>11}"
-                     f"{_pct(r.run_error_rate):>9}{obs:>10}")
-    lines.append("  Δ success = change in success rate when the component is REMOVED (paired, same seeds).")
-    lines.append("  observed = observed contribution in the baseline; compare it with the causal column.")
-    return "\n".join(lines)
-
-
-def render_resilience(report: Any) -> str:
-    b = report.baseline
-    lines = [f"FAILURE INJECTION vs {b.label}  (baseline success {_pct(b.success_rate)})",
-             f"  {'failure':<28}{'success':>9}{'resilience':>12}{'quality':>9}{'crashes':>9}{'Δ cost':>9}{'Δ latency':>11}"]
-    for r in report.rows:
-        v = r.comparison.variant
-        lines.append(f"  {r.failure:<28}{_pct(v.success_rate) if v else 'n/a':>9}{r.resilience*100:>11.0f}%"
-                     f"{r.quality_retention*100:>8.0f}%{_pct(r.run_error_rate):>9}"
-                     f"{_signed_pct(r.recovery_cost_pct):>9}{_signed_pct(r.recovery_latency_pct):>11}")
-    lines.append(f"  Mean resilience: {_pct(report.resilience)}  (variant success ÷ baseline success)")
-    return "\n".join(lines)
-
-
-def render_frontier(points: Sequence[Any], height: int = 8) -> str:
-    if not points:
-        return "no configurations"
-    lines = ["EFFICIENCY FRONTIER (success vs cost per run)",
-             f"  {'configuration':<34}{'success':>9}{'cost/run':>10}{'latency':>9}  frontier"]
-    for p in points:
-        lines.append(f"  {p.label[:33]:<34}{_pct(p.success):>9}{_money(p.cost):>10}{p.latency:>8.1f}s  "
-                     f"{'●' if p.on_frontier else '·'}")
-    # tiny ascii scatter
-    costs = [p.cost for p in points]
-    succ = [p.success for p in points]
-    cmin, cmax = min(costs), max(costs)
-    smin, smax = min(succ), max(succ)
-    width = 40
-    grid = [[" "] * (width + 1) for _ in range(height + 1)]
-    for p in points:
-        x = 0 if cmax == cmin else int(round((p.cost - cmin) / (cmax - cmin) * width))
-        y = 0 if smax == smin else int(round((p.success - smin) / (smax - smin) * height))
-        grid[height - y][x] = "●" if p.on_frontier else "·"
-    lines.append("")
-    for i, row in enumerate(grid):
-        label = f"{(smax - (smax - smin) * i / height)*100:5.0f}% │" if height else "      │"
-        lines.append("  " + label + "".join(row))
-    lines.append("        └" + "─" * (width + 1))
-    lines.append(f"         {_money(cmin):<20}{_money(cmax):>20}")
+def render_trajectory(traj: Trajectory, max_events: int = 200) -> str:
+    """Plain-text listing of one trajectory: what happened, in order."""
+    t0 = traj.started_at or (traj.events[0].timestamp if traj.events else 0.0)
+    ev_status = "✓" if traj.succeeded else "✗"
+    head = (f"run {traj.run_id}  task {traj.task_id}  trial {traj.trial}  status {traj.status}  "
+            f"eval {ev_status} {traj.score:.2f}  {traj.duration:.1f}s  {traj.total_tokens:,} tokens  "
+            f"{_money(traj.cost_usd, traj.cost_is_complete)}")
+    lines = [head, f"  {'t(s)':>7}  {'event':<12}{'agent':<16}detail"]
+    depth = {None: 0}
+    for ev in traj.events[:max_events]:
+        if ev.event_type == EventType.AGENT_START.value:
+            depth[ev.span_id] = depth.get(traj.spans[ev.span_id].parent_span_id if ev.span_id in traj.spans else None, 0) + 1
+        boundary = ev.event_type in (EventType.AGENT_START.value, EventType.AGENT_END.value)
+        indent = "  " * max(0, depth.get(ev.span_id, 0) - (1 if boundary else 0))
+        et = ev.event_type
+        if et == EventType.LLM_CALL.value:
+            detail = f"{ev.model or '?'}  {ev.input_tokens}→{ev.output_tokens} tok  {ev.duration_s:.2f}s  {_money(ev.cost_usd)}"
+        elif et == EventType.TOOL_CALL.value:
+            detail = f"{ev.tool_name}({preview(ev.tool_args, 60)})  {ev.duration_s:.2f}s"
+        elif et == EventType.MESSAGE.value:
+            detail = f"{ev.sender} → {ev.receiver}  [{ev.kind}]  {ev.content_tokens} tok"
+        elif et == EventType.ARTIFACT.value:
+            detail = f"{ev.kind}  {ev.content_tokens} tok"
+        elif et == EventType.ARTIFACT_USE.value:
+            detail = f"uses {ev.kind}"
+        elif et == EventType.AGENT_START.value:
+            detail = f"role={ev.kind or '-'} model={ev.model or '-'}"
+        elif et == EventType.AGENT_END.value:
+            detail = f"{ev.status}  {ev.duration_s:.2f}s"
+        elif et == EventType.WAIT.value:
+            detail = f"{ev.kind}  {ev.duration_s:.2f}s"
+        elif et == EventType.EVAL.value:
+            detail = f"{ev.content}  score={ev.metadata.get('score')}"
+        else:
+            detail = ev.error or preview(ev.content, 80)
+        flag = "" if ev.status == "success" else f" [{ev.status}]"
+        lines.append(f"  {ev.timestamp - t0:>7.2f}  {et:<12}{indent}{(ev.agent_id or '-'):<16}{detail}{flag}")
+    if len(traj.events) > max_events:
+        lines.append(f"  … {len(traj.events) - max_events} more events")
     return "\n".join(lines)

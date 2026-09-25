@@ -5,8 +5,6 @@
   with real token usage.
 * ``anthropic_llm(client, model)`` -- returns ``fn(prompt) -> LLMResult`` for
   use with ``AgentSpan.llm``.
-* ``anthropic_judge(client, model)`` -- returns ``fn(prompt) -> str`` for
-  ``LLMJudge``.
 
 The ``anthropic`` package is only imported when a client is not supplied.
 """
@@ -58,11 +56,6 @@ def anthropic_llm(client: Any = None, model: str = DEFAULT_MODEL, max_tokens: in
                          int(getattr(usage, "output_tokens", 0) or 0), getattr(resp, "model", model), resp)
 
     return call
-
-
-def anthropic_judge(client: Any = None, model: str = DEFAULT_MODEL, max_tokens: int = 1024) -> Callable[[str], str]:
-    llm = anthropic_llm(client, model=model, max_tokens=max_tokens)
-    return lambda prompt: llm(prompt).text
 
 
 def instrument_client(client: Any) -> Any:

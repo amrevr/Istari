@@ -1,23 +1,14 @@
 """A simulated multi-agent research swarm -- no API keys required.
 
-The swarm is deliberately imperfect so the evaluation has something to find:
+Used by ``swarmeval demo`` and the tests.  It shows how a swarm is
+instrumented through the ``RunContext`` / ``AgentSpan`` interface: agent
+spans, LLM calls with token usage, tool calls, messages and artifacts.
 
-* ``coordinator`` relays every message (bottleneck, context bloat),
-* ``researcher_a`` and ``researcher_c`` are given the same scope (redundancy),
-* ``researcher_c``'s notes are ignored unless ``researcher_a`` is missing
-  (zero observed value in normal runs, but real resilience value),
-* ``critic`` catches planted wrong facts (removing it hurts correctness),
-* ``synthesizer`` receives the whole history instead of the artifacts it needs.
-
-Configuration knobs (``SetParam``):
-    direct_channels   researchers/critic talk to their consumers directly
-    partition_scope   give researcher_c its own scope (source s5)
-    parallel_research run researchers concurrently (default True)
-    single_agent      one agent does everything
-    revision_rounds   max critic<->synthesizer revision rounds (default 2)
-
-Models can be swapped per agent with ``SetModel``; a weaker model finds fewer
-facts and catches fewer errors.
+The swarm has a coordinator, three researchers, a critic and a synthesizer.
+It is deliberately imperfect (the coordinator relays everything, two
+researchers share a scope, the synthesizer receives far more context than it
+needs) so that the coordination analysis planned for Phase 2 has something
+to find.  Phase 1 only records and measures it.
 
 The simulated clock (``SimClock``) is advanced explicitly so runs are instant
 but timings look real.
@@ -28,13 +19,12 @@ import random
 from functools import partial
 from typing import Any, Dict, List, Optional
 
-from swarmeval import (AgentDisabled, Benchmark, InjectedFailure, InterventionError, RunContext, SimClock, Swarm,
-                       SwarmConfig, Task)
+from swarmeval import Benchmark, RunContext, SimClock, Swarm, Task
 from swarmeval.schema import estimate_tokens
 
 MODEL_QUALITY = {"claude-opus-5": 0.985, "claude-sonnet-5": 0.96, "claude-haiku-4-5": 0.85}
-WRONG_FACT_PICKUP = 0.5   # how often a researcher records the planted wrong fact
 MODEL_SPEED = {"claude-opus-5": 55.0, "claude-sonnet-5": 90.0, "claude-haiku-4-5": 160.0}   # output tok/s
+WRONG_FACT_PICKUP = 0.5   # how often a researcher records the planted wrong fact
 
 TOPICS = [
     ("Aurora protocol", "aurora"), ("Helix compiler", "helix"), ("Quasar storage", "quasar"),
@@ -84,6 +74,8 @@ WORLD = build_world()
 
 
 def build_benchmark(n_tasks: int = 8) -> Benchmark:
+    """The standardized task format in use: input, expected keywords, success
+    criteria, constraints and a JSON evaluator spec per task."""
     tasks = []
     for tid, w in list(WORLD.items())[:n_tasks]:
         tasks.append(Task(
@@ -100,8 +92,7 @@ def build_benchmark(n_tasks: int = 8) -> Benchmark:
 
 
 class ResearchSwarm(Swarm):
-    def __init__(self, config: Optional[SwarmConfig] = None) -> None:
-        self.config = config or SwarmConfig()
+    """coordinator -> researchers (parallel) -> coordinator -> critic -> coordinator -> synthesizer"""
 
     # -- simulation helpers ---------------------------------------------------
     @staticmethod
@@ -113,14 +104,11 @@ class ResearchSwarm(Swarm):
             clock.sleep(seconds * 0.01)  # real clock: keep demos fast
 
     def _llm(self, ctx: RunContext, agent, prompt: str, out_tokens: int, extra_context_tokens: int = 0,
-             input_artifacts=(), relevant_tokens: Optional[int] = None, output: Optional[str] = None) -> str:
+             input_artifacts=(), output: Optional[str] = None) -> str:
+        """Simulate one LLM call and record it with realistic token counts and latency."""
         model = agent.model or "claude-sonnet-5"
         in_tokens = estimate_tokens(prompt) + extra_context_tokens
-        limit = ctx.context_limit(agent.agent_id)
-        if limit is not None and in_tokens > limit:
-            in_tokens = limit
-        meta = {"relevant_tokens": relevant_tokens} if relevant_tokens is not None else {}
-        with agent.llm_call(model=model, input_artifacts=input_artifacts, prompt=prompt, **meta) as call:
+        with agent.llm_call(model=model, input_artifacts=input_artifacts, prompt=prompt) as call:
             self._advance(ctx, 0.35 + out_tokens / MODEL_SPEED.get(model, 80.0) + in_tokens / 25000.0)
             call.input_tokens = in_tokens
             call.output_tokens = out_tokens
@@ -138,48 +126,29 @@ class ResearchSwarm(Swarm):
     # -- main flow ------------------------------------------------------------
     def run(self, task: Task, ctx: RunContext) -> Any:
         world = WORLD[task.task_id]
-        if ctx.param("single_agent", False):
-            return self._single_agent(task, ctx, world)
-        direct = bool(ctx.param("direct_channels", False))
-        partition = bool(ctx.param("partition_scope", False))
-        parallel = bool(ctx.param("parallel_research", True))
-        revision_rounds = int(ctx.param("revision_rounds", 2))
-        researchers = ["researcher_a", "researcher_b", "researcher_c"]
-        scopes = {"researcher_a": ["s1", "s2"], "researcher_b": ["s3", "s4"],
-                  "researcher_c": ["s5"] if partition else ["s1", "s2"]}
+        rng = ctx.rng
         clock = ctx.clock
+        researchers = ["researcher_a", "researcher_b", "researcher_c"]
+        scopes = {"researcher_a": ["s1", "s2"], "researcher_b": ["s3", "s4"], "researcher_c": ["s1", "s2"]}
 
         # 1. coordinator plans and delegates -------------------------------
-        try:
-            with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
-                self._llm(ctx, coord, f"Plan the research for: {task.input}", 300,
-                          output="Plan: split sources between researchers, verify with critic, synthesize.")
-                for r in researchers:
-                    if ctx.is_enabled(r):
-                        coord.send(r, f"Research {world['name']}. Cover sources {', '.join(scopes[r])} and report facts.",
-                                   kind="task_assignment", scope=scopes[r])
-        except (InterventionError, InjectedFailure):
-            ctx.set_output("")
-            return ""
+        with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
+            self._llm(ctx, coord, f"Plan the research for: {task.input}", 300,
+                      output="Plan: split sources between researchers, verify with critic, synthesize.")
+            for r in researchers:
+                coord.send(r, f"Research {world['name']}. Cover sources {', '.join(scopes[r])} and report facts.",
+                           kind="task_assignment", scope=scopes[r])
 
-        # 2. researchers ------------------------------------------------------
-        def research(r: str):
+        # 2. researchers (simulated as parallel on the virtual clock) ---------
+        def research(r: str) -> None:
             with ctx.agent(r, role="research", model="claude-sonnet-5") as agent:
-                msgs = agent.receive()
-                if not msgs:
-                    return None
-                scope = msgs[0].metadata.get("scope", [])
+                msg = agent.receive()[0]
+                scope = msg.metadata.get("scope", [])
                 q = self._quality(agent)
-                rng = agent.rng
-                self._llm(ctx, agent, f"Assignment: {msgs[0].content}. Decide search queries.", 120)
+                self._llm(ctx, agent, f"Assignment: {msg.content}. Decide search queries.", 120)
                 found: List[str] = []
                 for s in scope:
-                    try:
-                        hits = agent.call_tool("web_search", partial(self._search, ctx, world), query=s)
-                    except (InterventionError, InjectedFailure):
-                        hits = []
-                    if not isinstance(hits, list):
-                        hits = []
+                    hits = agent.call_tool("web_search", partial(self._search, ctx, world), query=s)
                     for fact in hits:
                         p_keep = WRONG_FACT_PICKUP if fact == world["wrong"] else q
                         if rng.random() < p_keep:
@@ -187,159 +156,74 @@ class ResearchSwarm(Swarm):
                 notes = "\n".join(found) if found else "No reliable information found."
                 self._llm(ctx, agent, f"Summarise findings:\n{notes}", 350, output=notes)
                 art = agent.produce(f"notes_{r[-1]}", notes)
-                target = "critic" if direct and ctx.is_enabled("critic") else "coordinator"
-                agent.send(target, notes, kind="result", artifacts=[art])
-                return art
+                agent.send("coordinator", notes, kind="result", artifacts=[art])
 
         t0 = clock.now()
         ends: List[float] = []
         for r in researchers:
-            if parallel and isinstance(clock, SimClock):
+            if isinstance(clock, SimClock):
                 clock.set(t0)
-            try:
-                research(r)
-            except (InterventionError, InjectedFailure):
-                pass
+            research(r)
             ends.append(clock.now())
-        if parallel and isinstance(clock, SimClock) and ends:
+        if isinstance(clock, SimClock):
             clock.set(max(ends))
 
         # 3. coordinator relays notes to the critic ------------------------
-        notes_msgs: Dict[str, Any] = {}
-        if direct:
-            pass
-        else:
-            try:
-                with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
-                    for m in coord.receive():
-                        notes_msgs[m.sender] = m
-                    chosen = [notes_msgs[a] for a in ("researcher_a", "researcher_b") if a in notes_msgs]
-                    if "researcher_a" not in notes_msgs and "researcher_c" in notes_msgs:
-                        chosen.append(notes_msgs["researcher_c"])
-                    arts = [a for m in chosen for a in m.artifacts]
-                    combined = "\n".join(str(m.content) for m in chosen)
-                    self._llm(ctx, coord, f"Forward these findings for review:\n{combined}", 150,
-                              extra_context_tokens=1800, input_artifacts=arts,
-                              output="Forwarding findings to the critic.")
-                    target = "critic" if ctx.is_enabled("critic") else "synthesizer"
-                    coord.send(target, combined, kind="request", artifacts=arts)
-            except (InterventionError, InjectedFailure):
-                pass
+        with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
+            notes_msgs = {m.sender: m for m in coord.receive()}
+            chosen = [notes_msgs[a] for a in ("researcher_a", "researcher_b") if a in notes_msgs]
+            arts = [a for m in chosen for a in m.artifacts]
+            combined = "\n".join(str(m.content) for m in chosen)
+            self._llm(ctx, coord, f"Forward these findings for review:\n{combined}", 150,
+                      extra_context_tokens=1800, input_artifacts=arts, output="Forwarding findings to the critic.")
+            coord.send("critic", combined, kind="request", artifacts=arts)
 
         # 4. critic verifies ---------------------------------------------------
-        critique_art = None
-        facts: List[str] = []
-        flagged: List[str] = []
-        if ctx.is_enabled("critic"):
-            try:
-                with ctx.agent("critic", role="critic", model="claude-opus-5") as critic:
-                    msgs = critic.receive()
-                    arts = [a for m in msgs for a in m.artifacts]
-                    for a in arts:
-                        critic.consume(a, purpose="review")
-                    facts = [ln for m in msgs for ln in str(m.content).splitlines() if ln.strip()]
-                    q = self._quality(critic)
-                    rng = critic.rng
-                    flagged = [f for f in facts if f == world["wrong"] and rng.random() < q]
-                    critique = ("Flagged as unsupported: " + "; ".join(flagged)) if flagged else "No issues found."
-                    self._llm(ctx, critic, "Review these findings for errors:\n" + "\n".join(facts), 400,
-                              input_artifacts=arts, output=critique)
-                    critique_art = critic.produce("critique", critique, intent="verification")
-                    target = "synthesizer" if direct else "coordinator"
-                    critic.send(target, critique, kind="feedback", artifacts=arts + [critique_art])
-            except (InterventionError, InjectedFailure):
-                critique_art = None
-        elif direct:
-            # no critic: researchers sent to critic; nothing arrives. Fall back to the coordinator's mailbox.
-            pass
+        with ctx.agent("critic", role="critic", model="claude-opus-5") as critic:
+            msgs = critic.receive()
+            arts = [a for m in msgs for a in m.artifacts]
+            for a in arts:
+                critic.consume(a, purpose="review")
+            facts = [ln for m in msgs for ln in str(m.content).splitlines() if ln.strip()]
+            q = self._quality(critic)
+            flagged = [f for f in facts if f == world["wrong"] and rng.random() < q]
+            critique = ("Flagged as unsupported: " + "; ".join(flagged)) if flagged else "No issues found."
+            self._llm(ctx, critic, "Review these findings for errors:\n" + "\n".join(facts), 400,
+                      input_artifacts=arts, output=critique)
+            critique_art = critic.produce("critique", critique)
+            critic.send("coordinator", critique, kind="feedback", artifacts=arts + [critique_art])
 
-        # 5. coordinator relays to synthesizer (bottleneck) -------------------
-        if not direct:
-            try:
-                with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
-                    msgs = coord.receive()
-                    arts = [a for m in msgs for a in m.artifacts]
-                    content = "\n".join(str(m.content) for m in msgs)
-                    self._llm(ctx, coord, f"Hand off to synthesizer:\n{content}", 120, extra_context_tokens=2600,
-                              input_artifacts=arts, output="Handing off to synthesizer.")
-                    coord.send("synthesizer", content, kind="request", artifacts=arts)
-            except (InterventionError, InjectedFailure):
-                pass
+        # 5. coordinator relays to synthesizer --------------------------------
+        with ctx.agent("coordinator", role="coordinator", model="claude-opus-5") as coord:
+            msgs = coord.receive()
+            arts = [a for m in msgs for a in m.artifacts]
+            content = "\n".join(str(m.content) for m in msgs)
+            self._llm(ctx, coord, f"Hand off to synthesizer:\n{content}", 120, extra_context_tokens=2600,
+                      input_artifacts=arts, output="Handing off to synthesizer.")
+            coord.send("synthesizer", content, kind="request", artifacts=arts)
 
-        # 6. synthesizer writes the brief (with revision loop) ---------------
-        answer = ""
-        final_art = None
-        try:
-            with ctx.agent("synthesizer", role="synthesizer", model="claude-opus-5") as synth:
-                msgs = synth.receive()
-                arts = [a for m in msgs for a in m.artifacts]
-                gathered: List[str] = []
-                for a in arts:
-                    art = synth.consume(a, purpose="synthesis")
-                    if art is not None and art.name.startswith("notes"):
-                        gathered.extend(ln for ln in str(art.content).splitlines() if ln.strip())
-                if not gathered:
-                    gathered = [ln for m in msgs for ln in str(m.content).splitlines() if ln.strip()]
-                flagged_set = set(flagged)
-                kept = [f for f in gathered if f not in flagged_set and f != "No reliable information found."]
-                relevant = sum(ctx.trajectory.artifacts[a].tokens for a in arts if a in ctx.trajectory.artifacts)
-                answer = f"Brief on {world['name']}:\n" + "\n".join(f"- {f}" for f in dict.fromkeys(kept))
-                self._llm(ctx, synth, "Write the brief from:\n" + "\n".join(kept), 700, extra_context_tokens=9000,
-                          input_artifacts=arts, relevant_tokens=relevant + 60, output=answer)
-                final_art = synth.produce("final_brief", answer)
-                # revision loop: critic asks for changes; synthesizer revises (ping-pong)
-                rounds = 0
-                rng = synth.rng
-                while rounds < revision_rounds and ctx.is_enabled("critic") and rng.random() < 0.35:
-                    rounds += 1
-                    if synth.send("critic", answer, kind="request", artifacts=[final_art]) is None:
-                        break  # channel disabled or message dropped: no review possible
-                    try:
-                        with ctx.agent("critic", role="critic", model="claude-opus-5") as critic:
-                            m = critic.receive()
-                            fb = "Please tighten the wording of the brief."
-                            self._llm(ctx, critic, "Review brief:\n" + answer, 150,
-                                      input_artifacts=[final_art], output=fb)
-                            critic.send("synthesizer", fb, kind="feedback")
-                    except (InterventionError, InjectedFailure):
-                        break
-                    synth.receive()
-                    self._llm(ctx, synth, "Revise the brief per feedback.", 500, extra_context_tokens=4000,
-                              input_artifacts=[final_art], output=answer)
-                    final_art = synth.produce("final_brief", answer)
-        except (InterventionError, InjectedFailure):
-            answer = ""
-        ctx.set_output(answer, artifacts=[final_art] if final_art else [])
-        return answer
-
-    # -- single-agent baseline ------------------------------------------------
-    def _single_agent(self, task: Task, ctx: RunContext, world: Dict[str, Any]) -> str:
-        with ctx.agent("solo", role="generalist", model="claude-opus-5") as agent:
-            q = self._quality(agent)
-            rng = agent.rng
-            self._llm(ctx, agent, f"Research and write: {task.input}", 200)
-            found: List[str] = []
-            for s in ("s1", "s2", "s3", "s4"):
-                try:
-                    hits = agent.call_tool("web_search", partial(self._search, ctx, world), query=s)
-                except (InterventionError, InjectedFailure):
-                    hits = []
-                for fact in (hits if isinstance(hits, list) else []):
-                    p_keep = WRONG_FACT_PICKUP if fact == world["wrong"] else q
-                    if rng.random() < p_keep:
-                        found.append(fact)
-            # a single agent self-checks less reliably than a dedicated critic
-            kept = [f for f in found if not (f == world["wrong"] and rng.random() < q * 0.55)]
-            answer = f"Brief on {world['name']}:\n" + "\n".join(f"- {f}" for f in kept)
-            self._llm(ctx, agent, "Write the brief:\n" + "\n".join(kept), 700, output=answer)
-            art = agent.produce("final_brief", answer)
-        ctx.set_output(answer, artifacts=[art])
+        # 6. synthesizer writes the brief -------------------------------------
+        with ctx.agent("synthesizer", role="synthesizer", model="claude-opus-5") as synth:
+            msgs = synth.receive()
+            arts = [a for m in msgs for a in m.artifacts]
+            gathered: List[str] = []
+            for a in arts:
+                art = synth.consume(a, purpose="synthesis")
+                if art is not None and art.name.startswith("notes"):
+                    gathered.extend(ln for ln in str(art.content).splitlines() if ln.strip())
+            flagged_set = set(flagged)
+            kept = [f for f in gathered if f not in flagged_set and f != "No reliable information found."]
+            answer = f"Brief on {world['name']}:\n" + "\n".join(f"- {f}" for f in dict.fromkeys(kept))
+            self._llm(ctx, synth, "Write the brief from:\n" + "\n".join(kept), 700, extra_context_tokens=9000,
+                      input_artifacts=arts, output=answer)
+            final_art = synth.produce("final_brief", answer)
+        ctx.set_output(answer, artifacts=[final_art])
         return answer
 
 
-def make_swarm(config: SwarmConfig) -> ResearchSwarm:
+def make_swarm() -> ResearchSwarm:
     """Factory used by ``swarmeval.evaluate`` and the CLI."""
-    return ResearchSwarm(config)
+    return ResearchSwarm()
 
 
 def sim_clock() -> SimClock:

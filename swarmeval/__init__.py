@@ -1,5 +1,7 @@
-"""SwarmEval -- evaluation, observability, diagnostics and causal analysis for
-multi-agent AI systems.
+"""SwarmEval -- evaluation and observability for multi-agent AI systems.
+
+Phase 1 (this release): trajectory recording, standardized task format,
+basic performance/efficiency metrics, text reports and JSON/JSONL export.
 
 Quick start::
 
@@ -8,32 +10,22 @@ Quick start::
     print(result.report())
 """
 from . import evaluators
-from .config import FailureSpec, SwarmConfig
-from .evaluate import EvaluationResult, RunAnalysis, analyze_runs, analyze_trajectory, evaluate
-from .recorder import (AgentDisabled, AgentSpan, BudgetExceeded, InjectedAgentCrash, InjectedFailure,
-                       InjectedLLMError, InjectedToolError, InterventionError, LLMResult, Message, RunContext,
-                       SimClock, ToolDisabled, WallClock)
+from .evaluate import EfficiencySummary, EvaluationResult, analyze_runs, evaluate
+from .recorder import AgentSpan, LLMCall, LLMResult, Message, RunContext, SimClock, ToolCall, WallClock
 from .runner import FunctionSwarm, RunOptions, RunSet, Swarm, SwarmRunner
 from .schema import Artifact, Benchmark, Evaluation, Event, EventType, Span, Task, Trajectory
-from .diagnostics import Diagnostic, SmellConfig
-from .causal import (CounterfactualRunner, Compose, DisableChannel, InjectFailure, RemoveAgent, RemoveTool,
-                     SetContextLimit, SetModel, SetParam, SetTokenBudget, ablate_agents, ablate_tools, compare,
-                     frontier, inject_failures, intelligence_vs_coordination)
-from .causal.experiments import ablate
+from .metrics import EfficiencyMetrics, PerformanceMetrics, compute_efficiency, compute_performance
+from .export import read_events_jsonl, write_events_jsonl
+from .report import render_text, render_trajectory
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "evaluate", "analyze_runs", "analyze_trajectory", "EvaluationResult", "RunAnalysis",
+    "evaluate", "analyze_runs", "EvaluationResult", "EfficiencySummary",
     "Task", "Benchmark", "Trajectory", "Event", "EventType", "Span", "Artifact", "Evaluation",
-    "RunContext", "AgentSpan", "Message", "LLMResult", "SimClock", "WallClock",
+    "RunContext", "AgentSpan", "Message", "LLMResult", "LLMCall", "ToolCall", "SimClock", "WallClock",
     "Swarm", "FunctionSwarm", "SwarmRunner", "RunOptions", "RunSet",
-    "SwarmConfig", "FailureSpec",
-    "InterventionError", "AgentDisabled", "ToolDisabled", "BudgetExceeded",
-    "InjectedFailure", "InjectedAgentCrash", "InjectedLLMError", "InjectedToolError",
-    "Diagnostic", "SmellConfig", "evaluators",
-    "CounterfactualRunner", "RemoveAgent", "RemoveTool", "DisableChannel", "SetModel", "SetParam",
-    "SetTokenBudget", "SetContextLimit", "InjectFailure", "Compose",
-    "ablate", "ablate_agents", "ablate_tools", "compare", "frontier", "inject_failures", "intelligence_vs_coordination",
-    "__version__",
+    "PerformanceMetrics", "EfficiencyMetrics", "compute_performance", "compute_efficiency",
+    "read_events_jsonl", "write_events_jsonl", "render_text", "render_trajectory",
+    "evaluators", "__version__",
 ]

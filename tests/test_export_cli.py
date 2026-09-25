@@ -1,11 +1,21 @@
 import json
-import os
 
 from examples.research_swarm import build_benchmark, make_swarm
-from swarmeval import EvaluationResult, SimClock, evaluate
+from swarmeval import (Benchmark, EvaluationResult, FunctionSwarm, SimClock, Task, evaluate, read_events_jsonl,
+                       render_trajectory, write_events_jsonl)
 from swarmeval.cli import main
-from swarmeval.export import read_events_jsonl, to_otel, write_events_jsonl
-from swarmeval.runner import RunSet
+from swarmeval.runner import RunSet, derive_seed
+
+
+def test_evaluate_runs_benchmark_and_is_reproducible():
+    a = evaluate(make_swarm, build_benchmark(3), trials=2, clock_factory=SimClock)
+    b = evaluate(make_swarm, build_benchmark(3), trials=2, clock_factory=SimClock)
+    assert len(a.runs) == 6 and a.performance.n_tasks == 3 and a.performance.trials == 2
+    assert [t.succeeded for t in a.runs] == [t.succeeded for t in b.runs]
+    assert a.efficiency.tokens.total == b.efficiency.tokens.total
+    assert derive_seed(0, "task_01", 0) != derive_seed(0, "task_01", 1)
+    assert a.agents == ["coordinator", "researcher_a", "researcher_b", "researcher_c", "critic", "synthesizer"]
+    assert a.efficiency.cost_complete and a.cost["total"] > 0
 
 
 def test_runset_and_result_roundtrip(tmp_path):
@@ -14,38 +24,74 @@ def test_runset_and_result_roundtrip(tmp_path):
     res.save(str(p))
     back = EvaluationResult.load(str(p))
     assert back.success_rate == res.success_rate
-    assert back.smells == res.smells
-    rs = RunSet.load(str(p)) if False else RunSet.from_dict(json.load(open(p))["runs"])
-    assert len(rs) == 2 and rs.config.label == "baseline"
+    assert back.summary() == res.summary()
+    rs = RunSet.from_dict(json.load(open(p))["runs"])
+    assert len(rs) == 2 and rs.label == "baseline" and rs.benchmark_name == "research_briefs"
+    d = res.to_dict()
+    assert "runs" not in d and len(d["per_run"]) == 2
 
 
-def test_jsonl_and_otel(tmp_path):
+def test_jsonl_export(tmp_path):
     res = evaluate(make_swarm, build_benchmark(1), trials=1, clock_factory=SimClock)
     traj = res.runs.trajectories[0]
     p = tmp_path / "e.jsonl"
     n = write_events_jsonl(traj, str(p))
-    assert n == len(traj.events) == len(read_events_jsonl(str(p)))
-    otel = to_otel(traj)
-    spans = otel["resourceSpans"][0]["scopeSpans"][0]["spans"]
-    names = {s["name"] for s in spans}
-    assert "agent:coordinator" in names and "llm_call" in names and "tool:web_search" in names
-    llm = next(s for s in spans if s["name"] == "llm_call")
-    keys = {a["key"] for a in llm["attributes"]}
-    assert {"gen_ai.request.model", "gen_ai.usage.input_tokens"} <= keys
-    json.dumps(otel)  # serialisable
+    events = read_events_jsonl(str(p))
+    assert n == len(traj.events) == len(events)
+    assert events[0].event_type == "run_start" and events[0].run_id == traj.run_id
+    with open(p) as f:
+        first = json.loads(f.readline())
+    assert set(first) >= {"event_id", "run_id", "task_id", "event_type", "timestamp"}
 
 
-def test_cli_demo_quick_and_run(tmp_path, capsys):
+def test_trajectory_text_rendering():
+    res = evaluate(make_swarm, build_benchmark(1), trials=1, clock_factory=SimClock)
+    text = render_trajectory(res.runs.trajectories[0])
+    assert "llm_call" in text and "web_search" in text and "coordinator" in text and "critic" in text
+
+
+def test_function_swarm_and_crash_is_a_result():
+    def good(task, ctx):
+        with ctx.agent("solo") as s:
+            s.llm(lambda: "the answer is 42", prompt=task.input)
+        return "42"
+
+    def bad(task, ctx):
+        with ctx.agent("solo"):
+            raise RuntimeError("kaboom")
+
+    bench = Benchmark("b", [Task("q", "what?", evaluator={"type": "exact_match", "expected": "42"})])
+    ok = evaluate(good, bench, clock_factory=SimClock)
+    assert ok.success_rate == 1.0 and isinstance(ok.runs.trajectories[0].metadata["swarm"], str)
+    crashed = evaluate(FunctionSwarm(bad), bench, clock_factory=SimClock)
+    t = crashed.runs.trajectories[0]
+    assert crashed.success_rate == 0.0 and t.status == "error" and "kaboom" in t.error
+    assert crashed.performance.run_errors == 1
+
+
+def test_benchmark_file_roundtrip_and_validation(tmp_path):
+    bench = build_benchmark(2)
+    p = tmp_path / "bench.json"
+    bench.save(str(p))
+    back = Benchmark.load(str(p))
+    assert [t.task_id for t in back] == [t.task_id for t in bench]
+    assert back.get("task_01").evaluator["type"] == "contains_all"
+    import pytest
+    with pytest.raises(ValueError):
+        Benchmark("dup", [Task("x", "a"), Task("x", "b")]).validate()
+    with pytest.raises(ValueError):
+        Task("x", "a", difficulty="impossible").validate()
+
+
+def test_cli_demo_run_report(tmp_path, capsys):
     out = tmp_path / "demo"
-    assert main(["demo", "--quick", "--trials", "1", "--out", str(out)]) == 0
-    assert (out / "baseline.html").exists() and (out / "baseline.events.jsonl").exists()
-    assert main(["run", "--swarm", "examples.research_swarm:make_swarm", "--benchmark",
-                 "examples.research_swarm:build_benchmark", "--trials", "1", "--clock", "sim",
-                 "--label", "cli", "--out", str(tmp_path / "run")]) == 0
-    assert main(["report", str(tmp_path / "run" / "cli.json")]) == 0
-    assert main(["compare", str(out / "baseline.json"), str(tmp_path / "run" / "cli.json")]) == 0
+    assert main(["demo", "--trials", "1", "--out", str(out), "--trace"]) == 0
+    assert (out / "baseline.json").exists() and (out / "baseline.events.jsonl").exists()
+    bench_path = tmp_path / "bench.json"
+    build_benchmark(2).save(str(bench_path))
+    assert main(["run", "--swarm", "examples.research_swarm:make_swarm", "--benchmark", str(bench_path),
+                 "--trials", "1", "--clock", "sim", "--label", "cli", "--out", str(tmp_path / "run")]) == 0
+    assert main(["report", str(tmp_path / "run" / "cli.json"), "--trace", "0"]) == 0
     captured = capsys.readouterr()
-    assert "SWARM EVALUATION" in captured.out and "baseline  →  cli" in captured.out
-    assert main(["inject", "--swarm", "examples.research_swarm:make_swarm", "--benchmark",
-                 "examples.research_swarm:build_benchmark", "--trials", "1", "--clock", "sim",
-                 "--failure", "agent_crash:critic"]) == 0
+    assert "SWARM EVALUATION" in captured.out and "cli  ·  research_briefs" in captured.out
+    assert "run_start" in captured.out
